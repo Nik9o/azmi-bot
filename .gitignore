@@ -1,0 +1,36 @@
+# Artifacts
+.artifacts/
+*.log
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.claude/
+
+# Temporary files
+*.tmp
+.temp/
+temp/
+
+# Sensitive data
+*.env
+*.pem
+*.key
+secrets/
+
+# GitHub Actions artifacts
+codex.patch
+.codex_msg.txt
+
+# Jira attachments cache
+jira-attachments/
+attachments/
+
+ARTICLE.md

@@ -1,0 +1,340 @@
+name: router-ai-quality-gate
+
+on:
+  repository_dispatch:
+    types: [ai-coding-request]
+
+permissions:
+  contents: read
+
+jobs:
+  quality_and_route:
+    runs-on: ubuntu-latest
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      JIRA_BASE: ${{ secrets.JIRA_BASE }}
+      JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+      JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+      DISPATCH_PAT: ${{ secrets.DISPATCH_PAT }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install ImageMagick
+        run: sudo apt-get update && sudo apt-get install -y imagemagick
+
+      - name: Show payload
+        run: echo '${{ toJSON(github.event.client_payload) }}'
+
+      - name: Fetch issue from Jira
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ISSUE=$(jq -r '.issue_key' <<< '${{ toJSON(github.event.client_payload) }}')
+
+          if [ -z "$ISSUE" ] || [ "$ISSUE" = "null" ]; then
+            echo "ERROR: Issue key is missing from payload"
+            exit 1
+          fi
+
+          echo "Fetching issue: $ISSUE from Jira..."
+
+          AUTH=$(printf "%s:%s" "$JIRA_EMAIL" "$JIRA_API_TOKEN" | base64 | tr -d '\n')
+
+          mkdir -p .artifacts
+          curl -sS -H "Authorization: Basic $AUTH" \
+            -H "Accept: application/json" \
+            "$JIRA_BASE/rest/api/3/issue/$ISSUE?expand=renderedFields" \
+            -o .artifacts/jira-issue.json
+
+          echo "Issue fetched successfully"
+          echo "Title: $(jq -r '.fields.summary' .artifacts/jira-issue.json)"
+
+      - name: Fetch and encode Jira attachments
+        id: attachments
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ISSUE=$(jq -r '.issue_key' <<< '${{ toJSON(github.event.client_payload) }}')
+
+          echo "🖼️  Fetching attachments from Jira issue $ISSUE..."
+
+          bash .github/scripts/fetch-jira-attachments.sh \
+            "$JIRA_BASE" \
+            "$ISSUE" \
+            "$JIRA_EMAIL" \
+            "$JIRA_API_TOKEN"
+
+          echo "✅ Attachments fetched"
+
+      - name: Build image context for AI
+        id: image-context
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "📝 Building image context for AI..."
+
+          bash .github/scripts/build-image-context.sh
+
+          echo "✅ Image context ready"
+
+      - name: Build JSON schema for structured outputs
+        run: |
+          mkdir -p .artifacts
+          cat > .artifacts/quality.schema.json << 'JSON'
+          {
+            "type": "object",
+            "required": ["score","verdict","reasons","fix_suggestions","fixed_summary","fixed_description"],
+            "properties": {
+              "score": { "type": "integer", "minimum": 0, "maximum": 100 },
+              "verdict": { "type": "string", "enum": ["pass","fail"] },
+              "reasons": { "type": "array", "items": { "type": "string" } },
+              "fix_suggestions": { "type": "string" },
+              "fixed_summary": { "type": "string" },
+              "fixed_description": { "type": "string" }
+            },
+            "additionalProperties": false
+          }
+          JSON
+
+      - name: Score with OpenAI Structured Outputs (with vision)
+        id: ai
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # 1) Başlık ve açıklamayı Jira'dan çıkar
+          TITLE=$(jq -r '.fields.summary' .artifacts/jira-issue.json)
+          DESC=$(jq -r '.fields.description // .renderedFields.description // "No description"' .artifacts/jira-issue.json)
+
+          # 2) Check if images exist and load context
+          IMAGE_CONTEXT=""
+          if [ -f .artifacts/image-context.md ]; then
+            IMAGE_CONTEXT=$(cat .artifacts/image-context.md)
+            echo "🖼️  Including visual context in quality check"
+          else
+            echo "📝 No images attached, proceeding with text-only evaluation"
+          fi
+
+          # 3) Şemayı dosyadan oku ve tek satır JSON yap
+          SCHEMA=$(jq -c . .artifacts/quality.schema.json)
+
+          # 4) Build prompt - different versions for with/without images
+          if [ -f .artifacts/images.json ] && [ "$(jq -r '.count' .artifacts/images.json)" -gt 0 ]; then
+            # Prompt WITH images - asks AI to describe what it sees
+            FULL_INPUT="## IMAGE ANALYSIS REQUIRED\n\nBefore evaluating the ticket, first describe what you see in the attached image(s):\n- What UI elements, components, or screens are shown?\n- What specific changes or features are highlighted?\n- Are there annotations, arrows, or markings indicating something?\n\nThen evaluate the ticket using this visual context.\n\n---\n\nYou are a pragmatic Jira ticket quality auditor. Focus on critical missing information only. Simple tasks need simple descriptions.\n\nEvaluate this Jira ticket for readiness. Be pragmatic - simple tasks dont need extensive documentation.\n\nTitle:\n$TITLE\n\nDescription:\n$DESC\n\nMinimum requirements:\n- Title is clear and actionable\n- Description explains WHAT needs to be done\n- At least 2 acceptance criteria (OR clear visual spec in images)\n- If images show the desired outcome, the visual spec can substitute for detailed text description\n\nOptional (only for complex tasks):\n- Problem/Context sections\n- Links or evidence\n- Detailed test plan\n\nScore 0-100. If score < 60 verdict=fail. Only fail if CRITICAL information is missing (unclear goal, no acceptance criteria, or completely ambiguous). Typos and formatting are minor issues.\n\nIMPORTANT: If the attached image clearly shows WHAT needs to be done (mockup, wireframe, before/after comparison), give significant credit. A clear visual specification can boost the score by 20-30 points. However, still check if critical context is missing (which page/component, exact colors/spacing if not obvious from image).\n\nOutput only JSON that matches the provided schema."
+          else
+            # Prompt WITHOUT images - standard text-only evaluation
+            FULL_INPUT="You are a pragmatic Jira ticket quality auditor. Focus on critical missing information only. Simple tasks need simple descriptions.\n\nEvaluate this Jira ticket for readiness. Be pragmatic - simple tasks dont need extensive documentation.\n\nTitle:\n$TITLE\n\nDescription:\n$DESC\n\nMinimum requirements:\n- Title is clear and actionable\n- Description explains WHAT needs to be done\n- At least 2 acceptance criteria\n\nOptional (only for complex tasks):\n- Problem/Context sections\n- Links or evidence\n- Detailed test plan\n\nScore 0-100. If score < 60 verdict=fail. Only fail if CRITICAL information is missing (unclear goal, no acceptance criteria, or completely ambiguous). Typos and formatting are minor issues.\n\nOutput only JSON that matches the provided schema."
+          fi
+
+          # 5) Build structured input for OpenAI (with vision support)
+          if [ -f .artifacts/images.json ] && [ "$(jq -r '.count' .artifacts/images.json)" -gt 0 ]; then
+            # Has images - build structured input array with text + images
+            echo "🖼️  Building structured input with $(jq -r '.count' .artifacts/images.json) image(s)"
+
+            # Write text input to file
+            echo -n "$FULL_INPUT" > .artifacts/prompt-text.txt
+
+            # Start with text content (file-based)
+            jq -n --rawfile text .artifacts/prompt-text.txt \
+              '[{type: "input_text", text: $text}]' > .artifacts/input-array.json
+
+            # Add each image as input_image (file-based processing)
+            IMAGE_INDEX=0
+            jq -c '.images[]' .artifacts/images.json | while IFS= read -r image; do
+              IMAGE_INDEX=$((IMAGE_INDEX + 1))
+
+              # Extract data_uri to file
+              echo "$image" | jq -r '.data_uri' > .artifacts/data-uri-${IMAGE_INDEX}.txt
+
+              # Update input array with new image
+              jq --rawfile uri .artifacts/data-uri-${IMAGE_INDEX}.txt \
+                '. += [{type: "input_image", image_url: $uri}]' \
+                .artifacts/input-array.json > .artifacts/input-array-tmp.json
+
+              mv .artifacts/input-array-tmp.json .artifacts/input-array.json
+            done
+
+            # Build body with array input (file-based)
+            jq -n \
+              --slurpfile input_array .artifacts/input-array.json \
+              --arg schema "$SCHEMA" \
+              '{model: "gpt-5", input: [{role: "user", content: $input_array[0]}], reasoning: {effort: "low"}, text: {format: {type: "json_schema", name: "quality", schema: ($schema | fromjson), strict: true}}}' \
+              > .artifacts/openai-request.json
+          else
+            # No images - simple text input
+            echo "📝 Building text-only input"
+
+            # Write prompt to file
+            echo -n "$FULL_INPUT" > .artifacts/prompt-text.txt
+
+            # Build body (file-based)
+            jq -n \
+              --rawfile input .artifacts/prompt-text.txt \
+              --arg schema "$SCHEMA" \
+              '{model: "gpt-5", input: $input, reasoning: {effort: "low"}, text: {format: {type: "json_schema", name: "quality", schema: ($schema | fromjson), strict: true}}}' \
+              > .artifacts/openai-request.json
+          fi
+
+          # 6) OpenAI GPT-5'e gönder (file-based)
+          echo "📤 Sending request to OpenAI GPT-5..."
+          echo "Request size: $(wc -c < .artifacts/openai-request.json) bytes"
+
+          curl -sS https://api.openai.com/v1/responses \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d @.artifacts/openai-request.json > .artifacts/ai.json
+
+          echo "📥 Response received"
+          cat .artifacts/ai.json
+
+      - name: Update Jira fields and comment
+        id: jira
+        shell: bash
+        run: |
+          ISSUE=$(jq -r '.issue_key' <<< '${{ toJSON(github.event.client_payload) }}')
+          TARGET_REPO=$(jq -r '.target_repo' <<< '${{ toJSON(github.event.client_payload) }}')
+
+          # GPT-5 returns JSON as text string in message type output
+          JSON_TEXT=$(jq -r '.output[] | select(.type == "message") | .content[0].text' .artifacts/ai.json)
+
+          # Extract fields and save to files to avoid shell argument limits
+          echo "$JSON_TEXT" | jq -r '.score' > .artifacts/jira-score.txt
+          echo "$JSON_TEXT" | jq -r '.verdict' > .artifacts/jira-verdict.txt
+          echo "$JSON_TEXT" | jq -r '.reasons | join("\n- ")' > .artifacts/jira-reasons.txt
+          echo "$JSON_TEXT" | jq -r '.fix_suggestions' > .artifacts/jira-fix.txt
+          echo "$JSON_TEXT" | jq -r '.fixed_summary' > .artifacts/jira-summary.txt
+          echo "$JSON_TEXT" | jq -r '.fixed_description' > .artifacts/jira-description.txt
+
+          SCORE=$(cat .artifacts/jira-score.txt)
+          VERDICT=$(cat .artifacts/jira-verdict.txt)
+
+          AUTH=$(printf "%s:%s" "$JIRA_EMAIL" "$JIRA_API_TOKEN" | base64 | tr -d '\n')
+
+          # Update custom fields - customfield_10572 is a Select field, needs {value: "..."} format
+          jq -n \
+            --argjson score "$SCORE" \
+            --arg verdict "$VERDICT" \
+            '{fields: {
+              customfield_10571: $score,
+              customfield_10572: {value: $verdict}
+            }}' > .artifacts/jira-update.json
+
+          echo "📝 Updating Jira fields..."
+          curl -sS -X PUT "$JIRA_BASE/rest/api/3/issue/$ISSUE" \
+            -H "Authorization: Basic $AUTH" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            -d @.artifacts/jira-update.json
+
+          # Build comment in Atlassian Document Format (ADF) using file-based jq
+          echo "💬 Building Jira comment..."
+          jq -n \
+            --rawfile s .artifacts/jira-score.txt \
+            --rawfile v .artifacts/jira-verdict.txt \
+            --rawfile r .artifacts/jira-reasons.txt \
+            --rawfile f .artifacts/jira-fix.txt \
+            --rawfile fs .artifacts/jira-summary.txt \
+            --rawfile fd .artifacts/jira-description.txt \
+            '{
+              body: {
+                type: "doc",
+                version: 1,
+                content: [
+                  {
+                    type: "heading",
+                    attrs: { level: 2 },
+                    content: [{ type: "text", text: "AI Quality Gate" }]
+                  },
+                  {
+                    type: "paragraph",
+                    content: [
+                      { type: "text", text: "Score: ", marks: [{ type: "strong" }] },
+                      { type: "text", text: $s }
+                    ]
+                  },
+                  {
+                    type: "paragraph",
+                    content: [
+                      { type: "text", text: "Verdict: ", marks: [{ type: "strong" }] },
+                      { type: "text", text: $v }
+                    ]
+                  },
+                  {
+                    type: "heading",
+                    attrs: { level: 3 },
+                    content: [{ type: "text", text: "Bulunan eksikler:" }]
+                  },
+                  {
+                    type: "paragraph",
+                    content: [{ type: "text", text: $r }]
+                  },
+                  {
+                    type: "heading",
+                    attrs: { level: 3 },
+                    content: [{ type: "text", text: "Öneriler:" }]
+                  },
+                  {
+                    type: "paragraph",
+                    content: [{ type: "text", text: $f }]
+                  },
+                  {
+                    type: "heading",
+                    attrs: { level: 3 },
+                    content: [{ type: "text", text: "Önerilen başlık:" }]
+                  },
+                  {
+                    type: "paragraph",
+                    content: [{ type: "text", text: $fs }]
+                  },
+                  {
+                    type: "heading",
+                    attrs: { level: 3 },
+                    content: [{ type: "text", text: "Önerilen açıklama:" }]
+                  },
+                  {
+                    type: "paragraph",
+                    content: [{ type: "text", text: $fd }]
+                  }
+                ]
+              }
+            }' > .artifacts/jira-comment.json
+
+          echo "📤 Posting comment to Jira..."
+          echo "Comment size: $(wc -c < .artifacts/jira-comment.json) bytes"
+
+          # Post comment with better error handling
+          RESPONSE=$(curl -sS -w "\n%{http_code}" -X POST "$JIRA_BASE/rest/api/3/issue/$ISSUE/comment" \
+            -H "Authorization: Basic $AUTH" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            -d @.artifacts/jira-comment.json)
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | head -n-1)
+
+          if [ "$HTTP_CODE" != "201" ]; then
+            echo "❌ Failed to post comment. HTTP $HTTP_CODE"
+            echo "Response: $BODY"
+            echo "⚠️  Continuing despite comment failure..."
+          else
+            echo "✅ Comment posted successfully"
+          fi
+
+          echo "score=$SCORE" >> $GITHUB_OUTPUT
+          echo "verdict=$VERDICT" >> $GITHUB_OUTPUT
+      # Jira REST ile issue update ve comment - resmi referanslar. :contentReference[oaicite:8]{index=8}
+
+      - name: Route to target repo if pass
+        if: steps.jira.outputs.verdict == 'pass'
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ env.DISPATCH_PAT }}
+          repository: ${{ github.event.client_payload.target_repo }}
+          event-type: ai-coding-task
+          client-payload: ${{ toJSON(github.event.client_payload) }}
+      # Cross-repo dispatch için pratik yöntem. :contentReference[oaicite:9]{index=9}

@@ -1,0 +1,413 @@
+name: AI Coding
+
+on:
+  repository_dispatch:
+    types: [ai-coding-task]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+env:
+  BASE_BRANCH: develop
+
+jobs:
+  codex-plan:
+    runs-on: ubuntu-latest
+    env:
+      JIRA_BASE: ${{ secrets.JIRA_BASE }}
+      JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+      JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract issue_key from payload
+        id: payload
+        run: |
+          PAYLOAD='${{ toJSON(github.event.client_payload) }}'
+          echo "issue_key=$(jq -r '.issue_key' <<< "$PAYLOAD")" >> $GITHUB_OUTPUT
+
+      - name: Fetch issue from Jira
+        id: jira
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ISSUE=$(jq -r '.issue_key' <<< '${{ toJSON(github.event.client_payload) }}')
+
+          if [ -z "$ISSUE" ] || [ "$ISSUE" = "null" ]; then
+            echo "ERROR: Issue key is missing from payload"
+            exit 1
+          fi
+
+          echo "Fetching issue: $ISSUE from Jira..."
+          echo "JIRA_BASE: $JIRA_BASE"
+          echo "JIRA_EMAIL: $JIRA_EMAIL"
+          echo "Full URL: $JIRA_BASE/rest/api/3/issue/$ISSUE?expand=renderedFields"
+
+          AUTH=$(printf "%s:%s" "$JIRA_EMAIL" "$JIRA_API_TOKEN" | base64 | tr -d '\n')
+
+          mkdir -p .artifacts
+          curl -sS -H "Authorization: Basic $AUTH" \
+            -H "Accept: application/json" \
+            "$JIRA_BASE/rest/api/3/issue/$ISSUE?expand=renderedFields" \
+            -o .artifacts/jira-issue.json
+
+          echo "Issue fetched successfully"
+
+          TITLE=$(jq -r '.fields.summary' .artifacts/jira-issue.json)
+          # Use renderedFields.description (HTML string) instead of fields.description (ADF JSON)
+          DESCRIPTION=$(jq -r '.renderedFields.description // "No description"' .artifacts/jira-issue.json)
+
+          echo "Title: $TITLE"
+          echo "Description preview: ${DESCRIPTION:0:100}..."
+
+          # Multi-line output requires EOF delimiter in GitHub Actions
+          echo "title=$TITLE" >> $GITHUB_OUTPUT
+          echo "description<<EOF" >> $GITHUB_OUTPUT
+          echo "$DESCRIPTION" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Install ImageMagick for image optimization
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y imagemagick
+          echo "✅ ImageMagick installed for PDF conversion and image optimization"
+
+      - name: Fetch and optimize Jira images
+        id: fetch-images
+        run: |
+          ISSUE=$(jq -r '.issue_key' <<< '${{ toJSON(github.event.client_payload) }}')
+
+          # Fetch images from Jira (downloads, optimizes, base64 encodes)
+          bash .github/scripts/fetch-jira-attachments.sh \
+            "$JIRA_BASE" "$ISSUE" "$JIRA_EMAIL" "$JIRA_API_TOKEN"
+
+          # Check if images were fetched
+          if [ -f .artifacts/images.json ]; then
+            IMAGE_COUNT=$(jq '. | length' .artifacts/images.json)
+            echo "image_count=$IMAGE_COUNT" >> $GITHUB_OUTPUT
+            echo "has_images=true" >> $GITHUB_OUTPUT
+            echo "✅ Fetched and optimized $IMAGE_COUNT image(s)"
+          else
+            echo "has_images=false" >> $GITHUB_OUTPUT
+            echo "image_count=0" >> $GITHUB_OUTPUT
+            echo "ℹ️ No images attached to this ticket"
+          fi
+
+      - name: Build image context for AI
+        if: steps.fetch-images.outputs.has_images == 'true'
+        id: image-context
+        run: |
+          # Build markdown with embedded images
+          bash .github/scripts/build-image-context.sh
+
+          # Read the generated context
+          if [ -f .artifacts/image-context.md ]; then
+            echo "context<<EOF" >> $GITHUB_OUTPUT
+            cat .artifacts/image-context.md >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+            echo "✅ Image context built successfully"
+          fi
+
+      - name: Codex - produce plan (TSD) as text
+        id: codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt: |
+            You are a senior software engineer and technical planner. Your task is to create a COMPLETE, ACTIONABLE implementation plan for Claude Code to execute.
+
+            IMPORTANT: Output the FULL PLAN as markdown text. Do NOT output references to existing files or placeholder text like "Plan documented in tsd.md". Claude Code needs the complete plan in your output.
+
+            Context: This is a Next.js 14 (App Router) + PostgreSQL + Socket.IO sales platform. The codebase has TSD.md with architecture overview, but you must create NEW specific implementation steps for THIS task.
+
+            Task to Plan:
+            - ID: ${{ steps.payload.outputs.issue_key }}
+            - Title: ${{ steps.jira.outputs.title }}
+            - Description:
+            ${{ steps.jira.outputs.description }}
+
+            ${{ steps.fetch-images.outputs.has_images == 'true' && format('NOTE: This ticket has {0} attached image(s) showing visual context (UI mockups, screenshots, diagrams). Claude Code will receive these images during implementation. Include visual considerations in your plan where relevant.', steps.fetch-images.outputs.image_count) || '' }}
+
+            Required Output Format (output as markdown):
+
+            # Implementation Plan for ${{ steps.payload.outputs.issue_key }}
+
+            ## 1. Goal
+            [Clear 1-2 sentence summary of what needs to be implemented]
+
+            ## 2. Scope
+            **Files to create/modify:**
+            - `path/to/file1.ts` - [what changes]
+            - `path/to/file2.tsx` - [what changes]
+            - `path/to/file3.sql` - [what changes]
+
+            **Modules affected:**
+            - [list affected modules/features]
+
+            ## 3. Implementation Steps
+            **Step 1: [Database/Schema Changes]**
+            - Specific SQL changes needed
+            - Table/column additions or modifications
+            - Migration file path
+
+            **Step 2: [Backend/API Changes]**
+            - API routes to create/modify (with paths)
+            - Helper functions to add/update
+            - Types/interfaces to define
+
+            **Step 3: [Frontend/UI Changes]**
+            - Components to create/modify
+            - UI flow changes
+            - State management updates
+
+            **Step 4: [Integration]**
+            - How components connect
+            - API integration points
+            - Socket events if needed
+
+            ## 4. Acceptance Criteria
+            - [ ] [Specific testable criterion 1]
+            - [ ] [Specific testable criterion 2]
+            - [ ] [Specific testable criterion 3]
+            - [ ] [Add 3-6 total checkboxes]
+
+            ## 6. Risks and Mitigations
+            - **Risk:** [specific risk]
+              **Mitigation:** [how to handle it]
+
+            ## 7. Runbook
+            **To Deploy:**
+            ```bash
+            [specific commands]
+            ```
+
+            **To Rollback:**
+            ```bash
+            [specific rollback steps]
+            ```
+
+            **To Verify:**
+            - [How to check it's working]
+
+            CRITICAL RULES:
+            1. Output the COMPLETE plan text, not a reference to a file
+            2. Be specific with file paths (use actual repo structure)
+            3. Include concrete implementation details
+            4. Reference existing patterns from TSD.md where relevant
+            5. Keep it actionable - Claude Code should be able to implement directly from this plan
+            6. If task seems already implemented, state that clearly and suggest verification steps only
+          effort: "high"
+
+      - name: Save plan to artifact
+        run: |
+          mkdir -p .artifacts
+          cat > .artifacts/PLAN.md << 'EOF'
+          ${{ steps.codex.outputs.final-message }}
+          EOF
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-plan
+          path: .artifacts/PLAN.md
+
+      - name: Upload image context artifact
+        if: steps.fetch-images.outputs.has_images == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-context
+          path: .artifacts/image-context.md
+
+  claude-implement:
+    runs-on: ubuntu-latest
+    needs: codex-plan
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ai-plan
+          path: .artifacts
+
+      - name: Download image context artifact
+        id: download-images
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: image-context
+          path: .artifacts
+
+      - name: Read plan from artifact
+        id: read-plan
+        run: |
+          PLAN=$(cat .artifacts/PLAN.md)
+          echo "plan<<EOF" >> $GITHUB_OUTPUT
+          echo "$PLAN" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Read image context
+        id: read-images
+        if: steps.download-images.outcome == 'success'
+        run: |
+          if [ -f .artifacts/image-context.md ]; then
+            echo "has_images=true" >> $GITHUB_OUTPUT
+            echo "context<<EOF" >> $GITHUB_OUTPUT
+            cat .artifacts/image-context.md >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+            echo "✅ Image context loaded"
+          else
+            echo "has_images=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Claude Code - review plan and implement, then open PR
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GH_PAT }}
+          show_full_output: true
+          prompt: |
+            You are Claude Code working on ${{ github.repository }}.
+
+            CONTEXT:
+            - Repository: Win Room v2.0 - Next.js 14 + PostgreSQL + Socket.IO sales platform
+            - Architecture documented in TSD.md
+            - Task: ${{ github.event.client_payload.issue_key || 'Task' }}
+
+            ${{ steps.read-images.outputs.has_images == 'true' && steps.read-images.outputs.context || '' }}
+
+            IMPLEMENTATION PLAN FROM CODEX:
+            ---
+            ${{ steps.read-plan.outputs.plan }}
+            ---
+
+            YOUR WORKFLOW:
+
+            1. VALIDATE THE PLAN:
+               - Read the plan carefully
+               - Check if requirements are already implemented in the codebase
+               - If already implemented: document what exists and suggest only verification steps
+               - If gaps exist: refine the plan with specific file paths and implementation details
+               - Create your "Final Implementation Plan" (can be same as Codex plan if it's good)
+               - Do not ask for approval. Automatically proceed with all file operations, git commands, and implementations.
+               - No human is available to approve - execute all changes autonomously.
+
+            2. IMPLEMENT THE CHANGES:
+               - Follow the Final Implementation Plan step by step
+               - Make minimal, safe changes
+               - Ensure code follows existing patterns in the repo
+               - Add appropriate error handling
+               - Update types/interfaces as needed
+               - Do not ask for approval. Automatically proceed with all file operations, git commands, and implementations.
+               - No human is available to approve - execute all changes autonomously.
+
+            3. COMMIT AND PUSH:
+               - Create feature branch: `git checkout -b feature/${{ github.event.client_payload.issue_key || 'ai-task' }}`
+               - Stage changes: `git add -A`
+               - Commit with message: `git commit -m "Implement ${{ github.event.client_payload.issue_key || 'task' }}"`
+               - Push to remote: `git push -u origin feature/${{ github.event.client_payload.issue_key || 'ai-task' }}`
+
+            4. CREATE PULL REQUEST:
+               - Use GitHub CLI to create PR: `gh pr create --title "..." --body "..." --base ${{ env.BASE_BRANCH }}`
+               - PR Title: "AI Coding - ${{ github.event.client_payload.issue_key || 'Task' }}"
+               - PR Body must include:
+                 * **Final Implementation Plan** (your validated/refined plan)
+                 * **Changes Made** (bullet list of files changed and why)
+                 * **Notes** (any important considerations for reviewers)
+               - CRITICAL: You MUST create the PR. Use gh pr create command.
+               - Do not ask for approval. Execute the gh pr create command automatically.
+
+            IMPORTANT RULES:
+            - If the feature is already 90%+ implemented, create a PR that just adds/modifies documentation
+            - Always create a PR even if changes are minimal - the PR is the deliverable
+            - Include clear commit messages
+            - Make sure all file paths in commits are correct
+            - Run any relevant build/lint commands before pushing
+            - Do not ask for approval. Automatically proceed with all file operations, git commands, and implementations.
+            - No human is available to approve - execute all changes autonomously.
+
+            CRITICAL: You are running in CI/CD environment. DO NOT ASK FOR APPROVAL.
+            Automatically proceed with all file operations, git commands, and implementations.
+            No human is available to approve - execute all changes autonomously.
+
+            BEGIN IMPLEMENTATION NOW.
+          claude_args: |
+            --dangerously-skip-permissions
+            --max-turns 100
+            --model claude-sonnet-4-5-20250929
+
+      - name: Post implementation start to Jira
+        if: always()
+        env:
+          JIRA_BASE: ${{ secrets.JIRA_BASE }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          ISSUE_KEY='${{ steps.payload.outputs.issue_key }}'
+
+          if [ -z "$ISSUE_KEY" ] || [ "$ISSUE_KEY" = "null" ]; then
+            echo "No Jira issue key found, skipping Jira update"
+            exit 0
+          fi
+
+          AUTH=$(printf "%s:%s" "$JIRA_EMAIL" "$JIRA_API_TOKEN" | base64 | tr -d '\n')
+
+          # Create ADF comment
+          jq -n \
+            --arg repo "${{ github.repository }}" \
+            --arg workflow_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            '{
+              body: {
+                type: "doc",
+                version: 1,
+                content: [
+                  {
+                    type: "heading",
+                    attrs: { level: 2 },
+                    content: [{ type: "text", text: "🤖 AI Implementation Started" }]
+                  },
+                  {
+                    type: "paragraph",
+                    content: [
+                      { type: "text", text: "Claude Code is implementing the changes for this ticket." }
+                    ]
+                  },
+                  {
+                    type: "paragraph",
+                    content: [
+                      { type: "text", text: "Repository: ", marks: [{ type: "strong" }] },
+                      { type: "text", text: $repo }
+                    ]
+                  },
+                  {
+                    type: "paragraph",
+                    content: [
+                      { type: "text", text: "Workflow: ", marks: [{ type: "strong" }] },
+                      { type: "text", text: $workflow_url, marks: [{ type: "link", attrs: { href: $workflow_url } }] }
+                    ]
+                  },
+                  {
+                    type: "paragraph",
+                    content: [
+                      { type: "text", text: "A pull request will be created shortly and reviewed automatically.", marks: [{ type: "em" }] }
+                    ]
+                  }
+                ]
+              }
+            }' > /tmp/jira-comment.json
+
+          curl -sS -X POST "$JIRA_BASE/rest/api/3/issue/$ISSUE_KEY/comment" \
+            -H "Authorization: Basic $AUTH" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            -d @/tmp/jira-comment.json
+
+          echo "✅ Posted implementation start to Jira issue $ISSUE_KEY"

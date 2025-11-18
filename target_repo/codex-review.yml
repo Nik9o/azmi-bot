@@ -1,0 +1,544 @@
+name: Codex Review and Merge
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# Only run for PRs created by AI Coding workflow
+jobs:
+  check-ai-coding:
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    steps:
+      - name: Check if PR is from AI Coding or Revision
+        id: check
+        run: |
+          TITLE="${{ github.event.pull_request.title }}"
+          # Check for various AI PR patterns:
+          # 1. Standard format: "AI Coding - ISSUE-KEY" or "AZMI Revision - ISSUE-KEY"
+          # 2. Direct JIRA issue format: "ISSUE-KEY | description"
+          # 3. Common JIRA prefixes: GET-, AZMI-, DEV-, TASK-
+
+          if [[ "$TITLE" == "AI Coding -"* ]] || \
+             [[ "$TITLE" == "AZMI Revision -"* ]] || \
+             [[ "$TITLE" =~ ^[A-Z]+-[0-9]+[[:space:]]*\| ]] || \
+             [[ "$TITLE" =~ ^(GET|AZMI|DEV|TASK|AI)-[0-9]+ ]]; then
+            echo "should_run=true" >> $GITHUB_OUTPUT
+            echo "✅ This is an AI PR - will run review"
+            echo "PR Title: $TITLE"
+          else
+            echo "should_run=false" >> $GITHUB_OUTPUT
+            echo "⏭️ Not an AI PR - skipping review"
+            echo "PR Title: $TITLE"
+          fi
+
+  codex-review:
+    runs-on: ubuntu-latest
+    needs: check-ai-coding
+    if: needs.check-ai-coding.outputs.should_run == 'true'
+    env:
+      JIRA_BASE: ${{ secrets.JIRA_BASE }}
+      JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+      JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Check review attempt count (prevent infinite loop)
+        id: check-attempts
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          ATTEMPTS=$(gh pr view ${{ github.event.pull_request.number }} --json comments --jq '[.comments[] | select(.body | contains("AI Code Review Summary"))] | length')
+
+          echo "Review attempts so far: $ATTEMPTS"
+
+          if [ "$ATTEMPTS" -ge 3 ]; then
+            echo "⚠️ Maximum review attempts reached ($ATTEMPTS/3). Stopping auto-review."
+            echo "too_many_attempts=true" >> $GITHUB_OUTPUT
+
+            # Post warning comment
+            WARNING_MSG="⚠️ **Maximum AI Review Attempts Reached**\n\nThis PR has been reviewed $ATTEMPTS times by the AI system. Manual review is now required.\n\n**Possible reasons:**\n- Code quality issues that AI cannot fix automatically\n- Complex architectural problems\n- Repeated test failures\n\nPlease review the previous AI feedback and make manual corrections."
+
+            echo -e "$WARNING_MSG" | gh pr comment ${{ github.event.pull_request.number }} --body-file -
+          else
+            echo "too_many_attempts=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Skip if too many attempts
+        if: steps.check-attempts.outputs.too_many_attempts == 'true'
+        run: |
+          echo "Stopping workflow - manual review required"
+          exit 0
+
+      - name: Fetch PR heads
+        run: |
+          git fetch --no-tags origin \
+            ${{ github.event.pull_request.base.ref }} \
+            ${{ github.event.pull_request.head.ref }} \
+            +refs/pull/${{ github.event.pull_request.number }}/head
+
+      - name: Extract Jira issue key from PR
+        id: jira-key
+        run: |
+          # Try to extract from PR title first (format: "AI Coding - GET-1234")
+          TITLE="${{ github.event.pull_request.title }}"
+          ISSUE_KEY=$(echo "$TITLE" | grep -oE '[A-Z]+-[0-9]+' | head -1 || echo "")
+
+          if [ -z "$ISSUE_KEY" ]; then
+            # Try from PR body
+            ISSUE_KEY=$(echo "${{ github.event.pull_request.body }}" | grep -oE '[A-Z]+-[0-9]+' | head -1 || echo "")
+          fi
+
+          echo "issue_key=$ISSUE_KEY" >> $GITHUB_OUTPUT
+          echo "Found Jira issue: $ISSUE_KEY"
+
+      - name: Codex - review PR and generate patch if needed
+        id: codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt: |
+            You are a senior code reviewer. Review ONLY the changes in this PR for ${{ github.repository }}.
+
+            **YOUR TASK:**
+            1. Evaluate code quality and score 0-100
+            2. Identify issues (security, performance, logic, quality)
+            3. If there are BLOCKING issues, generate a unified diff patch to fix them
+
+            **SCORING CRITERIA:**
+            - 85-100: Excellent - ready to merge
+            - 70-84: Good - minor issues acceptable
+            - 50-69: Fair - needs improvement
+            - 0-49: Poor - requires major revision
+
+            **DEDUCTIONS:**
+            - Security vulnerabilities: -30 points
+            - Logic errors: -20 points
+            - Performance issues: -10 points
+            - Code quality issues: -5 points
+            - Missing tests: -10 points
+
+            **OUTPUT FORMAT (IMPORTANT: DO NOT USE MARKDOWN CODE BLOCKS):**
+            If there are blocking issues that you can fix automatically, output in PLAIN TEXT:
+
+            Score: [number]
+            Verdict: request_changes
+            Issues:
+            - [issue 1]
+            - [issue 2]
+
+            === BEGIN PATCH ===
+            [unified diff patch here - use proper diff format with --- and +++ headers]
+            === END PATCH ===
+
+            If no blocking issues or you cannot create an automatic fix, output in PLAIN TEXT:
+
+            Score: [number]
+            Verdict: approve
+            Issues:
+            - [issue 1 if any]
+            - [issue 2 if any]
+
+            **IMPORTANT**:
+            - Patch should be a valid unified diff that can be applied with `git apply`
+            - Only create patches for blocking issues you can fix confidently
+            - Score > 80 should generally pass without patches unless critical security issues exist
+          effort: "high"
+
+      - name: Parse Codex review result
+        id: parse-review
+        run: |
+          set -e
+
+          # Parse text response from Codex
+          RESPONSE='${{ steps.codex.outputs.final-message }}'
+          echo "$RESPONSE" > .artifacts/codex_review.txt
+
+          # Extract score (handles both plain text and markdown formats)
+          # First try plain text format
+          SCORE=$(echo "$RESPONSE" | grep -iE "^\s*Score:\s*" | head -1 | sed 's/.*Score:\s*//i' | sed 's/[^0-9].*//' || echo "")
+
+          # If empty, try without anchoring to beginning
+          if [ -z "$SCORE" ]; then
+            SCORE=$(echo "$RESPONSE" | grep -i "Score:" | head -1 | sed 's/.*Score:\s*//i' | sed 's/[^0-9].*//' || echo "0")
+          fi
+
+          # Validate score is a number, default to 0 if not
+          if ! [[ "$SCORE" =~ ^[0-9]+$ ]] || [ -z "$SCORE" ]; then
+            echo "⚠️ Warning: Could not parse score from Codex response, defaulting to 0"
+            echo "Response excerpt: $(echo "$RESPONSE" | head -5)"
+            SCORE=0
+          fi
+
+          # Extract verdict (handles both plain text and markdown)
+          VERDICT=$(echo "$RESPONSE" | grep -iE "^\s*Verdict:\s*" | head -1 | sed 's/.*Verdict:\s*//i' | sed 's/\s*$//' || echo "")
+
+          # If empty, try without anchoring
+          if [ -z "$VERDICT" ]; then
+            VERDICT=$(echo "$RESPONSE" | grep -i "Verdict:" | head -1 | sed 's/.*Verdict:\s*//i' | sed 's/\s*$//' || echo "Needs Review")
+          fi
+
+          # Validate verdict is not empty
+          if [ -z "$VERDICT" ]; then
+            VERDICT="Needs Review"
+          fi
+
+          # Extract issues (lines starting with -)
+          ISSUES=$(echo "$RESPONSE" | sed -n '/^Issues:/,/^=== BEGIN PATCH ===/p' | grep "^-" | sed 's/^- //' || echo "No issues found")
+
+          # Check if patch exists
+          if echo "$RESPONSE" | grep -q "^=== BEGIN PATCH ==="; then
+            echo "has_patch=true" >> $GITHUB_OUTPUT
+
+            # Extract patch
+            mkdir -p .artifacts
+            echo "$RESPONSE" | sed -n '/^=== BEGIN PATCH ===/,/^=== END PATCH ===/p' | \
+              grep -v "^===" > .artifacts/codex.patch
+
+            echo "📝 Patch extracted to .artifacts/codex.patch"
+          else
+            echo "has_patch=false" >> $GITHUB_OUTPUT
+            echo "✅ No patch needed"
+          fi
+
+          echo "score=$SCORE" >> $GITHUB_OUTPUT
+          echo "verdict=$VERDICT" >> $GITHUB_OUTPUT
+
+          # Save issues to file for Claude Code (multi-line safe)
+          echo "issues<<EOF" >> $GITHUB_OUTPUT
+          echo "$ISSUES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          # Determine if PR should proceed (score > 80 per ARTICLE.md)
+          if [ "$SCORE" -gt 80 ]; then
+            echo "should_proceed=true" >> $GITHUB_OUTPUT
+            echo "✅ Score: $SCORE - PR can proceed"
+          else
+            echo "should_proceed=false" >> $GITHUB_OUTPUT
+            echo "❌ Score: $SCORE - PR needs revision"
+          fi
+
+      - name: Apply Codex patch if exists
+        if: steps.parse-review.outputs.has_patch == 'true'
+        run: |
+          echo "🔧 Applying Codex patch..."
+
+          # Ensure we're on the correct branch
+          git checkout -B ${{ github.event.pull_request.head.ref }}
+          git branch --set-upstream-to=origin/${{ github.event.pull_request.head.ref }}
+
+          # Apply patch with whitespace fixing
+          if git apply --whitespace=fix .artifacts/codex.patch; then
+            echo "✅ Patch applied successfully"
+
+            # Commit the changes
+            git config user.name "GitHub Actions"
+            git config user.email "actions@github.com"
+            git add -A
+            git commit -m "Fix: Apply Codex review patch (Score: ${{ steps.parse-review.outputs.score }})"
+
+            # Push with explicit ref
+            git push origin HEAD:${{ github.event.pull_request.head.ref }}
+
+            echo "✅ Patch committed and pushed"
+          else
+            echo "❌ Patch failed to apply - will be handled by Claude Code"
+            exit 0  # Don't fail the workflow, let Claude Code handle it
+          fi
+
+      - name: Claude Code - evaluate and fix issues
+        if: steps.parse-review.outputs.issues != ''
+        id: claude-fix
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GH_PAT }}
+          show_full_output: true
+          prompt: |
+            You are Claude Code performing code review fixes on PR #${{ github.event.pull_request.number }}.
+
+            **CONTEXT:**
+            - Repository: ${{ github.repository }}
+            - PR Branch: ${{ github.event.pull_request.head.ref }}
+            - Base Branch: ${{ github.event.pull_request.base.ref }}
+            - Codex Review Score: ${{ steps.parse-review.outputs.score }}/100
+
+            **CODEX REVIEW FINDINGS:**
+            ${{ steps.parse-review.outputs.issues }}
+
+            **YOUR TASK:**
+            1. **READ AND UNDERSTAND** the Codex findings above
+            2. **EXAMINE THE CODE** to verify each issue
+            3. **EVALUATE** each finding:
+               - Is this a real bug or false positive?
+               - Is it critical/high/medium/low severity?
+               - Should it be fixed now or is it acceptable?
+            4. **FIX ONLY WHAT'S NECESSARY**:
+               - Fix CRITICAL and HIGH severity issues immediately
+               - Fix MEDIUM severity if it's a quick fix
+               - Skip LOW severity or false positives
+            5. **COMMIT CHANGES** to the PR branch if you make any fixes
+
+            **IMPORTANT RULES:**
+            - You are already on the PR branch (${{ github.event.pull_request.head.ref }})
+            - DO NOT create a new branch
+            - Make minimal, surgical fixes
+            - Each fix should address one specific Codex finding
+            - Use clear commit messages: "Fix: [issue description]"
+            - If no fixes needed, just explain why in your response
+            - DO NOT ask for approval - you're in CI/CD, execute autonomously
+
+            **COMMIT WORKFLOW (if fixes needed):**
+            ```bash
+            git add -A
+            git commit -m "AI Review Fixes: Address Codex findings (Score: ${{ steps.parse-review.outputs.score }})"
+            git push origin ${{ github.event.pull_request.head.ref }}
+            ```
+
+            BEGIN EVALUATION AND FIXES NOW.
+          claude_args: |
+            --dangerously-skip-permissions
+            --max-turns 50
+            --model claude-sonnet-4-5-20250929
+
+      - name: Post review summary as comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const score = '${{ steps.parse-review.outputs.score }}';
+            const verdict = '${{ steps.parse-review.outputs.verdict }}';
+            // Use JSON.stringify to safely handle multi-line strings and special characters
+            const issuesRaw = ${{ toJSON(steps.parse-review.outputs.issues) }};
+            const claudeFixRaw = ${{ toJSON(steps.claude-fix.outputs.response) }} || 'No fixes needed - issues were false positives or low severity';
+
+            const issues = issuesRaw || '';
+            const claudeFix = claudeFixRaw || 'No fixes needed - issues were false positives or low severity';
+
+            const codexSummary = issues ? '**Issues Found:**\n- ' + issues : '**No major issues found**';
+
+            // Determine status emoji
+            const statusEmoji = score >= 85 ? '✅' : score >= 70 ? '⚠️' : '❌';
+
+            const body = '## ' + statusEmoji + ' AI Code Review Summary\n\n' +
+              '**Codex Score**: ' + score + '/100\n' +
+              '**Verdict**: ' + verdict + '\n\n' +
+              '### 📋 Codex Findings\n' +
+              codexSummary + '\n\n' +
+              '---\n\n' +
+              '### 🔧 Claude Code Evaluation & Fixes\n' +
+              claudeFix + '\n\n' +
+              '---\n\n' +
+              '**Next Steps:**\n' +
+              (score > 80 ? '✅ PR approved - will auto-merge if checks pass' : '❌ PR needs revision - score too low (threshold: 80)');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: body
+            });
+
+      - name: Approve PR if score > 80
+        if: steps.parse-review.outputs.should_proceed == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+              event: "APPROVE",
+              body: `✅ LGTM - Codex Score: ${{ steps.parse-review.outputs.score }}/100 (threshold: 80)`
+            });
+
+      - name: Post review summary to Jira
+        if: steps.jira-key.outputs.issue_key != ''
+        run: |
+          ISSUE_KEY="${{ steps.jira-key.outputs.issue_key }}"
+
+          if [ -z "$ISSUE_KEY" ]; then
+            echo "No Jira issue found, skipping Jira update"
+            exit 0
+          fi
+
+          mkdir -p .artifacts
+
+          # Save variables to files to avoid shell escaping issues
+          echo -n "${{ github.event.pull_request.html_url }}" > .artifacts/pr_url.txt
+          echo -n "${{ steps.parse-review.outputs.score }}" > .artifacts/score.txt
+          echo -n "${{ steps.parse-review.outputs.verdict }}" > .artifacts/verdict.txt
+          echo -n "${{ steps.parse-review.outputs.issues }}" > .artifacts/issues.txt
+          echo -n "${{ steps.claude-fix.outputs.response }}" > .artifacts/claude_fix.txt
+
+          SCORE=$(cat .artifacts/score.txt)
+          AUTH=$(printf "%s:%s" "$JIRA_EMAIL" "$JIRA_API_TOKEN" | base64 | tr -d '\n')
+
+          # Determine review status based on score
+          if [ "$SCORE" -gt 50 ]; then
+            echo -n "✅ Approved (Score: $SCORE/100)" > .artifacts/status.txt
+          else
+            echo -n "❌ Changes Requested (Score: $SCORE/100)" > .artifacts/status.txt
+          fi
+
+          # Create ADF (Atlassian Document Format) comment using file-based jq
+          jq -n \
+            --rawfile status .artifacts/status.txt \
+            --rawfile pr_url .artifacts/pr_url.txt \
+            --rawfile score .artifacts/score.txt \
+            --rawfile verdict .artifacts/verdict.txt \
+            --rawfile issues .artifacts/issues.txt \
+            --rawfile claude_fix .artifacts/claude_fix.txt \
+            '{
+              body: {
+                type: "doc",
+                version: 1,
+                content: [
+                  {
+                    type: "heading",
+                    attrs: { level: 2 },
+                    content: [{ type: "text", text: "🤖 AI Code Review Completed" }]
+                  },
+                  {
+                    type: "paragraph",
+                    content: [
+                      { type: "text", text: "Status: ", marks: [{ type: "strong" }] },
+                      { type: "text", text: $status }
+                    ]
+                  },
+                  {
+                    type: "paragraph",
+                    content: [
+                      { type: "text", text: "Score: ", marks: [{ type: "strong" }] },
+                      { type: "text", text: ($score + "/100") }
+                    ]
+                  },
+                  {
+                    type: "paragraph",
+                    content: [
+                      { type: "text", text: "Pull Request: ", marks: [{ type: "strong" }] },
+                      { type: "text", text: $pr_url, marks: [{ type: "link", attrs: { href: $pr_url } }] }
+                    ]
+                  },
+                  {
+                    type: "heading",
+                    attrs: { level: 3 },
+                    content: [{ type: "text", text: "📋 Codex Findings:" }]
+                  },
+                  {
+                    type: "paragraph",
+                    content: [{ type: "text", text: ($issues | if . == "" then "No major issues found" else . end) }]
+                  },
+                  {
+                    type: "heading",
+                    attrs: { level: 3 },
+                    content: [{ type: "text", text: "🔧 Claude Code Evaluation:" }]
+                  },
+                  {
+                    type: "paragraph",
+                    content: [{ type: "text", text: ($claude_fix | if . == "" then "No fixes applied - issues were false positives or low severity" else . end) }]
+                  }
+                ]
+              }
+            }' > .artifacts/jira-comment.json
+
+          echo "📤 Posting review comment to Jira..."
+
+          curl -sS -X POST "$JIRA_BASE/rest/api/3/issue/$ISSUE_KEY/comment" \
+            -H "Authorization: Basic $AUTH" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            -d @.artifacts/jira-comment.json
+
+          echo "✅ Posted review summary to Jira issue $ISSUE_KEY"
+
+      - name: Move Jira issue to Review status
+        if: steps.jira-key.outputs.issue_key != ''
+        run: |
+          ISSUE_KEY="${{ steps.jira-key.outputs.issue_key }}"
+
+          if [ -z "$ISSUE_KEY" ]; then
+            echo "No Jira issue found, skipping status transition"
+            exit 0
+          fi
+
+          AUTH=$(printf "%s:%s" "$JIRA_EMAIL" "$JIRA_API_TOKEN" | base64 | tr -d '\n')
+
+          # Get available transitions for this issue
+          TRANSITIONS=$(curl -sS -X GET "$JIRA_BASE/rest/api/3/issue/$ISSUE_KEY/transitions" \
+            -H "Authorization: Basic $AUTH" \
+            -H "Accept: application/json")
+
+          echo "Available transitions:"
+          echo "$TRANSITIONS" | jq '.transitions[] | {id: .id, name: .name}'
+
+          # Find transition ID for "Review" status (try common names)
+          TRANSITION_ID=$(echo "$TRANSITIONS" | jq -r '.transitions[] | select(.name | test("Review|In Review|Code Review"; "i")) | .id' | head -1)
+
+          if [ -z "$TRANSITION_ID" ] || [ "$TRANSITION_ID" = "null" ]; then
+            echo "⚠️ No 'Review' transition found for issue $ISSUE_KEY"
+            echo "Available transitions are listed above. Please configure Jira workflow."
+            exit 0
+          fi
+
+          # Perform transition
+          TRANSITION_BODY=$(jq -n --arg id "$TRANSITION_ID" '{transition: {id: $id}}')
+
+          curl -sS -X POST "$JIRA_BASE/rest/api/3/issue/$ISSUE_KEY/transitions" \
+            -H "Authorization: Basic $AUTH" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            --data "$TRANSITION_BODY"
+
+          echo "✅ Moved Jira issue $ISSUE_KEY to Review status (transition ID: $TRANSITION_ID)"
+
+      - name: Merge PR if score > 80
+        if: steps.parse-review.outputs.should_proceed == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GH_PAT }}
+          script: |
+            try {
+              const score = '${{ steps.parse-review.outputs.score }}';
+
+              // Force merge with admin token - bypasses branch protection
+              const result = await github.rest.pulls.merge({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.payload.pull_request.number,
+                merge_method: "squash",
+                commit_title: `${context.payload.pull_request.title} (#${context.payload.pull_request.number})`,
+                commit_message: `✅ Auto-merged after AI Review (Codex Score: ${score}/100)`
+              });
+              core.info(`✅ Merged successfully: ${result.data.message}`);
+            } catch (e) {
+              core.error(`❌ Merge failed: ${e.message}`);
+
+              // Detailed diagnostics
+              const pr = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.payload.pull_request.number
+              });
+
+              core.info(`PR State: ${pr.data.state}`);
+              core.info(`Mergeable: ${pr.data.mergeable}`);
+              core.info(`Mergeable State: ${pr.data.mergeable_state}`);
+              core.info(`Merged: ${pr.data.merged}`);
+
+              if (pr.data.mergeable_state === 'blocked') {
+                core.warning('⚠️ PR is blocked. Check branch protection rules or failing checks.');
+              }
+
+              throw e;
+            }

@@ -1,0 +1,258 @@
+name: Revision Router
+
+on:
+  repository_dispatch:
+    types: [ai-revision-request]
+
+permissions:
+  contents: read
+
+jobs:
+  quality-gate:
+    runs-on: ubuntu-latest
+    env:
+      JIRA_BASE: ${{ secrets.JIRA_BASE }}
+      JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+      JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ImageMagick
+        run: sudo apt-get update && sudo apt-get install -y imagemagick
+
+      - name: Extract payload
+        id: payload
+        run: |
+          PAYLOAD='${{ toJSON(github.event.client_payload) }}'
+          echo "🔍 DEBUG: Full payload received from Jira:"
+          echo "$PAYLOAD" | jq '.'
+
+          echo "issue_key=$(jq -r '.issue_key' <<< "$PAYLOAD")" >> $GITHUB_OUTPUT
+          echo "target_repo=$(jq -r '.target_repo' <<< "$PAYLOAD")" >> $GITHUB_OUTPUT
+
+      - name: Fetch Jira comments and find latest #AZMI request
+        id: comments
+        run: |
+          ISSUE="${{ steps.payload.outputs.issue_key }}"
+          AUTH=$(printf "%s:%s" "$JIRA_EMAIL" "$JIRA_API_TOKEN" | base64 | tr -d '\n')
+
+          echo "💬 Fetching comments from Jira issue $ISSUE..."
+
+          # Create artifacts directory
+          mkdir -p .artifacts
+
+          # Fetch all comments
+          curl -sS -H "Authorization: Basic $AUTH" \
+            -H "Accept: application/json" \
+            "$JIRA_BASE/rest/api/3/issue/$ISSUE/comment" \
+            -o .artifacts/jira-comments.json
+
+          # Find the last comment containing #AZMI
+          LAST_AZMI_COMMENT=$(jq -r '
+            .comments[]
+            | select(.body.content[].content[]?.text? // "" | contains("#AZMI"))
+            | .body.content[].content[]?.text? // ""
+            | select(. != "")
+          ' .artifacts/jira-comments.json | tail -1)
+
+          if [ -z "$LAST_AZMI_COMMENT" ]; then
+            echo "⚠️  No #AZMI comment found, using empty string"
+            LAST_AZMI_COMMENT=""
+          else
+            echo "✅ Found #AZMI comment: $LAST_AZMI_COMMENT"
+          fi
+
+          # Output the comment body (strip #AZMI tag for cleaner processing)
+          CLEAN_COMMENT=$(echo "$LAST_AZMI_COMMENT" | sed 's/#AZMI//g' | sed 's/^[[:space:]]*//g')
+
+          echo "comment_body<<EOF" >> $GITHUB_OUTPUT
+          echo "$CLEAN_COMMENT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Fetch Jira issue for context
+        id: jira
+        run: |
+          ISSUE="${{ steps.payload.outputs.issue_key }}"
+          AUTH=$(printf "%s:%s" "$JIRA_EMAIL" "$JIRA_API_TOKEN" | base64 | tr -d '\n')
+
+          mkdir -p .artifacts
+
+          # Fetch issue with development info expanded
+          curl -sS -H "Authorization: Basic $AUTH" \
+            -H "Accept: application/json" \
+            "$JIRA_BASE/rest/api/3/issue/$ISSUE?expand=renderedFields" \
+            -o .artifacts/jira-issue.json
+
+          TITLE=$(jq -r '.fields.summary' .artifacts/jira-issue.json)
+          DESCRIPTION=$(jq -r '.renderedFields.description // "No description"' .artifacts/jira-issue.json)
+
+          # Try to extract PR URL from AZMI Bot's previous comment
+          echo "🔍 Looking for PR URL in AZMI Bot comments..."
+          PR_URL=$(jq -r '
+            .comments[]?
+            | select(.author.displayName? // "" | contains("AZMI") or contains("Bot"))
+            | .body.content[]?.content[]?.text? // ""
+            | select(. | test("github.com/[^/]+/[^/]+/pull/[0-9]+"))
+          ' .artifacts/jira-comments.json 2>/dev/null | grep -oE 'https://github.com/[^/]+/[^/]+/pull/[0-9]+' | head -1 || echo "")
+
+          if [ -z "$PR_URL" ]; then
+            echo "⚠️  No PR URL found in AZMI comments"
+          else
+            echo "✅ Found PR URL: $PR_URL"
+          fi
+
+          echo "title=$TITLE" >> $GITHUB_OUTPUT
+          echo "description<<EOF" >> $GITHUB_OUTPUT
+          echo "$DESCRIPTION" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
+
+      - name: Fetch and encode Jira attachments
+        id: attachments
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ISSUE=$(jq -r '.issue_key' <<< '${{ toJSON(github.event.client_payload) }}')
+
+          echo "🖼️  Fetching attachments from Jira issue $ISSUE..."
+
+          bash .github/scripts/fetch-jira-attachments.sh \
+            "$JIRA_BASE" \
+            "$ISSUE" \
+            "$JIRA_EMAIL" \
+            "$JIRA_API_TOKEN"
+
+          echo "✅ Attachments fetched"
+
+      - name: Build image context for AI
+        id: image-context
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "📝 Building image context for AI..."
+
+          # For revisions, limit to last 3 images (most recent uploads)
+          bash .github/scripts/build-image-context.sh 3
+
+          if [ -f .artifacts/image-context.md ]; then
+            echo "has_images=true" >> $GITHUB_OUTPUT
+            IMAGE_COUNT=$(jq -r '.count' .artifacts/images.json 2>/dev/null || echo "0")
+            echo "image_count=$IMAGE_COUNT" >> $GITHUB_OUTPUT
+            echo "✅ Image context ready ($IMAGE_COUNT images)"
+          else
+            echo "has_images=false" >> $GITHUB_OUTPUT
+            echo "image_count=0" >> $GITHUB_OUTPUT
+            echo "📝 No images found"
+          fi
+
+      - name: Extract previous PR number from URL
+        id: pr-info
+        run: |
+          PR_URL="${{ steps.jira.outputs.pr_url }}"
+
+          if [ -z "$PR_URL" ] || [ "$PR_URL" = "null" ]; then
+            echo "⚠️  No previous PR URL found"
+            echo "pr_number=" >> $GITHUB_OUTPUT
+            echo "pr_url=" >> $GITHUB_OUTPUT
+          else
+            # Extract PR number from URL like https://github.com/org/repo/pull/123
+            PR_NUMBER=$(echo "$PR_URL" | grep -oE '[0-9]+$')
+            echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+            echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
+            echo "✅ Found PR #$PR_NUMBER: $PR_URL"
+          fi
+
+      - name: Move to In Progress
+        if: steps.comments.outputs.comment_body != ''
+        run: |
+          ISSUE="${{ steps.payload.outputs.issue_key }}"
+          AUTH=$(printf "%s:%s" "$JIRA_EMAIL" "$JIRA_API_TOKEN" | base64 | tr -d '\n')
+
+          # Get available transitions
+          TRANSITIONS=$(curl -sS -X GET "$JIRA_BASE/rest/api/3/issue/$ISSUE/transitions" \
+            -H "Authorization: Basic $AUTH" \
+            -H "Accept: application/json")
+
+          # Find transition ID for "In Progress"
+          TRANSITION_ID=$(echo "$TRANSITIONS" | jq -r '.transitions[] | select(.name | test("In Progress|In Development"; "i")) | .id' | head -1)
+
+          if [ -n "$TRANSITION_ID" ] && [ "$TRANSITION_ID" != "null" ]; then
+            TRANSITION_BODY=$(jq -n --arg id "$TRANSITION_ID" '{transition: {id: $id}}')
+
+            curl -sS -X POST "$JIRA_BASE/rest/api/3/issue/$ISSUE/transitions" \
+              -H "Authorization: Basic $AUTH" \
+              -H "Accept: application/json" \
+              -H "Content-Type: application/json" \
+              --data "$TRANSITION_BODY"
+
+            echo "✅ Moved issue to In Progress"
+          else
+            echo "⚠️ No 'In Progress' transition found"
+          fi
+
+      - name: Dispatch to target repository
+        if: steps.comments.outputs.comment_body != ''
+        run: |
+          TARGET_REPO="${{ steps.payload.outputs.target_repo }}"
+
+          if [ -z "$TARGET_REPO" ] || [ "$TARGET_REPO" = "null" ]; then
+            echo "ERROR: target_repo is required"
+            exit 1
+          fi
+
+          # Write each variable to a file to avoid shell escaping issues
+          echo -n "${{ steps.payload.outputs.issue_key }}" > .artifacts/dispatch-issue_key.txt
+          echo -n "${{ steps.jira.outputs.title }}" > .artifacts/dispatch-title.txt
+          echo -n "${{ steps.jira.outputs.description }}" > .artifacts/dispatch-description.txt
+          echo -n "${{ steps.comments.outputs.comment_body }}" > .artifacts/dispatch-comment.txt
+          echo -n "${{ steps.pr-info.outputs.pr_url }}" > .artifacts/dispatch-pr_url.txt
+          echo -n "${{ steps.pr-info.outputs.pr_number }}" > .artifacts/dispatch-pr_number.txt
+
+          # Image context (now optimized to 50-100KB per image, safe for dispatch)
+          if [ -f .artifacts/image-context.md ]; then
+            IMAGE_COUNT=$(jq -r '.count' .artifacts/images.json 2>/dev/null || echo "0")
+            echo "📸 Including optimized image context in payload ($IMAGE_COUNT images)"
+            cat .artifacts/image-context.md > .artifacts/dispatch-image_context.txt
+          else
+            echo "📭 No image context to include"
+            echo -n "" > .artifacts/dispatch-image_context.txt
+          fi
+
+          # Build dispatch payload using file-based jq processing
+          jq -n \
+            --rawfile issue_key .artifacts/dispatch-issue_key.txt \
+            --rawfile title .artifacts/dispatch-title.txt \
+            --rawfile description .artifacts/dispatch-description.txt \
+            --rawfile comment .artifacts/dispatch-comment.txt \
+            --rawfile pr_url .artifacts/dispatch-pr_url.txt \
+            --rawfile pr_number .artifacts/dispatch-pr_number.txt \
+            --rawfile image_context .artifacts/dispatch-image_context.txt \
+            '{
+              event_type: "ai-revision-task",
+              client_payload: {
+                issue_key: $issue_key,
+                title: $title,
+                description: $description,
+                revision_comment: $comment,
+                previous_pr_url: $pr_url,
+                previous_pr_number: $pr_number,
+                image_context: $image_context
+              }
+            }' > .artifacts/dispatch-payload.json
+
+          echo "Dispatching to: $TARGET_REPO"
+          echo "Payload preview (first 500 chars):"
+          head -c 500 .artifacts/dispatch-payload.json
+          echo ""
+          echo "..."
+
+          curl -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.DISPATCH_PAT }}" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/$TARGET_REPO/dispatches" \
+            -d @.artifacts/dispatch-payload.json
+
+          echo "✅ Dispatched revision task to $TARGET_REPO"

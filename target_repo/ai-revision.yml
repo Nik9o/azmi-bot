@@ -1,0 +1,352 @@
+name: AI Revision
+
+on:
+  repository_dispatch:
+    types: [ai-revision-task]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+env:
+  BASE_BRANCH: main
+
+jobs:
+  codex-revision-plan:
+    runs-on: ubuntu-latest
+    env:
+      JIRA_BASE: ${{ secrets.JIRA_BASE }}
+      JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+      JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract payload
+        id: payload
+        run: |
+          PAYLOAD='${{ toJSON(github.event.client_payload) }}'
+
+          # Create artifacts directory
+          mkdir -p .artifacts
+
+          # Extract simple fields
+          echo "issue_key=$(jq -r '.issue_key' <<< "$PAYLOAD")" >> $GITHUB_OUTPUT
+          echo "title=$(jq -r '.title' <<< "$PAYLOAD")" >> $GITHUB_OUTPUT
+          echo "previous_pr_number=$(jq -r '.previous_pr_number // ""' <<< "$PAYLOAD")" >> $GITHUB_OUTPUT
+
+          # Extract multiline fields using EOF delimiter
+          echo "revision_comment<<EOF" >> $GITHUB_OUTPUT
+          jq -r '.revision_comment' <<< "$PAYLOAD" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          echo "description<<EOF" >> $GITHUB_OUTPUT
+          jq -r '.description' <<< "$PAYLOAD" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          echo "image_context<<EOF" >> $GITHUB_OUTPUT
+          jq -r '.image_context // ""' <<< "$PAYLOAD" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Fetch previous PR changes
+        id: pr-changes
+        if: steps.payload.outputs.previous_pr_number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          PR_NUMBER="${{ steps.payload.outputs.previous_pr_number }}"
+
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No previous PR number provided"
+            echo "has_pr=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Fetching PR #$PR_NUMBER details..."
+
+          # Get PR diff
+          mkdir -p .artifacts
+          gh pr diff "$PR_NUMBER" > .artifacts/previous-pr.diff || true
+
+          # Get PR details
+          gh pr view "$PR_NUMBER" --json title,body,files > .artifacts/pr-details.json || true
+
+          if [ -f .artifacts/previous-pr.diff ]; then
+            echo "has_pr=true" >> $GITHUB_OUTPUT
+            echo "Previous PR diff saved to .artifacts/previous-pr.diff"
+
+            # Output PR summary
+            echo "pr_summary<<EOF" >> $GITHUB_OUTPUT
+            echo "## Previous PR #$PR_NUMBER" >> $GITHUB_OUTPUT
+            echo "" >> $GITHUB_OUTPUT
+            echo "**Title:** $(jq -r '.title' .artifacts/pr-details.json)" >> $GITHUB_OUTPUT
+            echo "" >> $GITHUB_OUTPUT
+            echo "**Files Changed:**" >> $GITHUB_OUTPUT
+            jq -r '.files[] | "- \(.path)"' .artifacts/pr-details.json >> $GITHUB_OUTPUT
+            echo "" >> $GITHUB_OUTPUT
+            echo "**Diff:**" >> $GITHUB_OUTPUT
+            echo '```diff' >> $GITHUB_OUTPUT
+            head -n 200 .artifacts/previous-pr.diff >> $GITHUB_OUTPUT
+            echo '```' >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          else
+            echo "has_pr=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Codex - create revision plan
+        id: codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt: |
+            You are a senior software engineer creating a REVISION PLAN for an existing implementation.
+
+            NOTE: This ticket may have attached images showing visual context (UI mockups, bugs, before/after). Claude Code will receive these images during implementation. Include visual considerations in your plan where relevant.
+
+            CONTEXT:
+            This is a Next.js 14 (App Router) + PostgreSQL + Socket.IO sales platform.
+
+            ORIGINAL TASK:
+            - ID: ${{ steps.payload.outputs.issue_key }}
+            - Title: ${{ steps.payload.outputs.title }}
+            - Description: ${{ steps.payload.outputs.description }}
+
+            PREVIOUS IMPLEMENTATION:
+            ${{ steps.pr-changes.outputs.has_pr == 'true' && steps.pr-changes.outputs.pr_summary || 'No previous PR available - this may be a new revision request without PR context.' }}
+
+            REVISION REQUEST:
+            ${{ steps.payload.outputs.revision_comment }}
+
+            Your task: Create a COMPLETE, ACTIONABLE revision plan that addresses the feedback above.
+
+            Required Output Format (output as markdown):
+
+            # Revision Plan for ${{ steps.payload.outputs.issue_key }}
+
+            ## 1. Revision Summary
+            [1-2 sentences: What needs to be changed and why]
+
+            ## 2. Changes Needed
+            **Files to modify:**
+            - `path/to/file1.ts` - [specific changes needed]
+            - `path/to/file2.tsx` - [specific changes needed]
+
+            **What to fix/improve:**
+            - [Specific issue 1 and how to fix it]
+            - [Specific issue 2 and how to fix it]
+
+            ## 3. Implementation Steps
+            **Step 1: [Category of changes]**
+            - Specific change 1
+            - Specific change 2
+
+            **Step 2: [Next category]**
+            - Specific change 1
+            - Specific change 2
+
+            ## 4. Testing Requirements
+            **New/Updated Tests:**
+            - Test [specific scenario]
+            - Verify [specific behavior]
+
+            **Manual Verification:**
+            - [How to verify the fix works]
+            - [What to check in staging]
+
+            ## 5. Acceptance Criteria
+            - [ ] [Specific testable criterion 1]
+            - [ ] [Specific testable criterion 2]
+            - [ ] [Original issue is resolved]
+
+            CRITICAL RULES:
+            1. Output the COMPLETE plan text, not a reference to a file
+            2. Be specific with file paths and line numbers if mentioned in revision request
+            3. Reference the previous implementation when suggesting changes
+            4. If revision request is unclear, make reasonable assumptions and document them
+            5. Keep changes minimal - only address what was requested
+          effort: "high"
+
+      - name: Save revision plan
+        run: |
+          mkdir -p .artifacts
+          cat > .artifacts/REVISION_PLAN.md << 'EOF'
+          ${{ steps.codex.outputs.final-message }}
+          EOF
+
+      - name: Upload revision plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: revision-plan
+          path: .artifacts/REVISION_PLAN.md
+
+  claude-implement-revision:
+    runs-on: ubuntu-latest
+    needs: codex-revision-plan
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for better git context
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: revision-plan
+          path: .artifacts
+
+      - name: Read revision plan
+        id: read-plan
+        run: |
+          PLAN=$(cat .artifacts/REVISION_PLAN.md)
+          echo "plan<<EOF" >> $GITHUB_OUTPUT
+          echo "$PLAN" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Extract payload
+        id: payload
+        run: |
+          PAYLOAD='${{ toJSON(github.event.client_payload) }}'
+          echo "issue_key=$(jq -r '.issue_key' <<< "$PAYLOAD")" >> $GITHUB_OUTPUT
+          echo "previous_pr_number=$(jq -r '.previous_pr_number // ""' <<< "$PAYLOAD")" >> $GITHUB_OUTPUT
+
+      - name: Install ImageMagick for image optimization
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y imagemagick
+          echo "✅ ImageMagick installed for PDF conversion and image optimization"
+
+      - name: Securely fetch images from Jira
+        id: fetch-images
+        env:
+          JIRA_BASE: ${{ secrets.JIRA_BASE }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          ISSUE_KEY="${{ steps.payload.outputs.issue_key }}"
+
+          # SECURITY: Never trust payload images - always re-fetch from Jira API
+          bash .github/scripts/fetch-jira-attachments.sh \
+            "$JIRA_BASE" "$ISSUE_KEY" "$JIRA_EMAIL" "$JIRA_API_TOKEN"
+
+          # Check if images were fetched
+          if [ -f .artifacts/images.json ]; then
+            IMAGE_COUNT=$(jq '. | length' .artifacts/images.json)
+            echo "image_count=$IMAGE_COUNT" >> $GITHUB_OUTPUT
+            echo "has_images=true" >> $GITHUB_OUTPUT
+            echo "✅ Securely fetched and optimized $IMAGE_COUNT image(s)"
+          else
+            echo "has_images=false" >> $GITHUB_OUTPUT
+            echo "image_count=0" >> $GITHUB_OUTPUT
+            echo "ℹ️ No images attached to this revision"
+          fi
+
+      - name: Build image context
+        if: steps.fetch-images.outputs.has_images == 'true'
+        id: image-context
+        run: |
+          bash .github/scripts/build-image-context.sh
+
+          if [ -f .artifacts/image-context.md ]; then
+            echo "context<<EOF" >> $GITHUB_OUTPUT
+            cat .artifacts/image-context.md >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+            echo "✅ Image context built successfully"
+          fi
+
+      - name: Claude Code - implement revision
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GH_PAT }}
+          show_full_output: true
+          prompt: |
+            You are Claude Code working on ${{ github.repository }}.
+
+            CONTEXT:
+            - Repository: Win Room v2.0 - Next.js 14 + PostgreSQL + Socket.IO sales platform
+            - Architecture documented in TSD.md
+            - Task: ${{ github.event.client_payload.issue_key || 'Revision' }}
+            - Previous PR: #${{ steps.payload.outputs.previous_pr_number }}
+
+            ${{ steps.image-context.outputs.context || '' }}
+
+            ⚠️ CRITICAL - PRIMARY DIRECTIVE ⚠️
+            The user has provided a REVISION REQUEST. This is your PRIMARY directive.
+            You MUST follow the revision request EXACTLY as written. The Codex plan below is a suggestion,
+            but if it conflicts with the revision request, ALWAYS follow the revision request.
+
+            REVISION PLAN FROM CODEX (secondary guidance):
+            ---
+            ${{ steps.read-plan.outputs.plan }}
+            ---
+
+            YOUR WORKFLOW:
+
+            1. UNDERSTAND THE CONTEXT:
+               - **PRIMARY**: Read the Codex revision plan above - it contains the USER'S REVISION REQUEST
+               - If previous PR number is provided, examine those changes: `gh pr view ${{ steps.payload.outputs.previous_pr_number }} --json files,diff`
+               - Understand what was implemented before and what needs to change
+               - If images are provided, study them carefully for visual bugs/requirements
+
+            2. VALIDATE THE REVISION PLAN:
+               - **PRIMARY**: Ensure you understand the USER'S EXACT REQUEST from the Codex plan
+               - Check if the requested changes make sense
+               - Verify files mentioned in the plan exist
+               - Identify any missing context or dependencies
+               - Create your "Final Revision Plan" that EXACTLY addresses the user's request
+               - Do not ask for approval. Automatically proceed with all file operations.
+
+            3. IMPLEMENT THE REVISIONS:
+               - **CRITICAL**: Follow the user's revision request EXACTLY - do not add extra features
+               - Make minimal, surgical changes - ONLY what was explicitly requested
+               - If user says "use Bootstrap class X", use that class, don't write custom CSS
+               - If user says "fix bug Y", fix ONLY that bug, don't refactor unrelated code
+               - Ensure code follows existing patterns
+               - Add appropriate error handling
+               - Update types/interfaces as needed
+               - Do not ask for approval. Automatically proceed.
+
+            4. UPDATE/ADD TESTS:
+               - Update existing tests if behavior changed
+               - Add new tests for new functionality
+               - Ensure all tests pass
+
+            5. COMMIT AND PUSH:
+               - Create revision branch: `git checkout -b revision/${{ github.event.client_payload.issue_key || 'ai-revision' }}`
+               - Stage changes: `git add -A`
+               - Commit: `git commit -m "Revision: ${{ github.event.client_payload.issue_key || 'revision' }}"`
+               - Push: `git push -u origin revision/${{ github.event.client_payload.issue_key || 'ai-revision' }}`
+
+            6. CREATE PULL REQUEST:
+               - Use: `gh pr create --title "..." --body "..." --base ${{ env.BASE_BRANCH }}`
+               - PR Title: "AZMI Revision - ${{ github.event.client_payload.issue_key || 'Task' }}"
+               - PR Body must include:
+                 * **Revision Request** (what was asked to change)
+                 * **Previous PR** (link to #${{ steps.payload.outputs.previous_pr_number }})
+                 * **Final Revision Plan** (your validated plan)
+                 * **Changes Made** (bullet list of files changed and why)
+                 * **Testing Done** (what tests were updated/added)
+               - CRITICAL: You MUST create the PR automatically.
+               - Do not ask for approval.
+
+            IMPORTANT RULES:
+            - Make surgical, minimal changes - don't refactor unrelated code
+            - Reference previous PR to understand context
+            - Always create a PR - the PR is the deliverable
+            - Run build/lint commands before pushing
+            - If revision request is ambiguous, make best judgment and document assumptions in PR
+
+            CRITICAL: You are running in CI/CD environment. DO NOT ASK FOR APPROVAL.
+            Automatically proceed with all file operations, git commands, and implementations.
+            No human is available to approve - execute all changes autonomously.
+
+            BEGIN REVISION IMPLEMENTATION NOW.
+          claude_args: |
+            --dangerously-skip-permissions
+            --max-turns 100
+            --model claude-sonnet-4-5-20250929
