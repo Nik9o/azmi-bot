@@ -191,7 +191,7 @@ jobs:
 
           echo "📤 Sending review request to Gemini 3 Pro..."
 
-          curl -sS "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro:generateContent" \
+          curl -sS "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-preview:generateContent" \
             -H "x-goog-api-key: $GEMINI_API_KEY" \
             -H "Content-Type: application/json" \
             -d @.artifacts/gemini-review-request.json > .artifacts/gemini-review-response.json
@@ -354,7 +354,7 @@ jobs:
 
           echo "📤 Sending fix request to Gemini 3 Pro..."
 
-          curl -sS "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro:generateContent" \
+          curl -sS "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-preview:generateContent" \
             -H "x-goog-api-key: $GEMINI_API_KEY" \
             -H "Content-Type: application/json" \
             -d @.artifacts/gemini-fix-request.json > .artifacts/gemini-fix-response.json

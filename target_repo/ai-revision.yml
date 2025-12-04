@@ -365,7 +365,7 @@ jobs:
 
           echo "📤 Sending revision request to Gemini 3 Pro..."
 
-          curl -sS "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro:generateContent" \
+          curl -sS "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-preview:generateContent" \
             -H "x-goog-api-key: $GEMINI_API_KEY" \
             -H "Content-Type: application/json" \
             -d @.artifacts/gemini-revision-request.json > .artifacts/gemini-response.json

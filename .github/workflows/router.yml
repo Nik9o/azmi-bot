@@ -200,7 +200,7 @@ jobs:
           echo "📤 Sending request to Gemini 3 Pro..."
           echo "Request size: $(wc -c < .artifacts/gemini-request.json) bytes"
 
-          curl -sS "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro:generateContent" \
+          curl -sS "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-preview:generateContent" \
             -H "x-goog-api-key: $GEMINI_API_KEY" \
             -H "Content-Type: application/json" \
             -d @.artifacts/gemini-request.json > .artifacts/ai.json
@@ -215,16 +215,36 @@ jobs:
           ISSUE=$(jq -r '.issue_key' <<< '${{ toJSON(github.event.client_payload) }}')
           TARGET_REPO=$(jq -r '.target_repo' <<< '${{ toJSON(github.event.client_payload) }}')
 
+          # Check if Gemini returned an error
+          if jq -e '.error' .artifacts/ai.json > /dev/null 2>&1; then
+            echo "❌ Gemini API Error:"
+            jq '.error' .artifacts/ai.json
+            echo ""
+            echo "Full response:"
+            cat .artifacts/ai.json
+            exit 1
+          fi
+
+          # Check if candidates exist
+          if ! jq -e '.candidates[0].content.parts[0].text' .artifacts/ai.json > /dev/null 2>&1; then
+            echo "❌ Unexpected Gemini response format:"
+            cat .artifacts/ai.json
+            exit 1
+          fi
+
           # Gemini 3 Pro returns JSON in candidates[0].content.parts[0].text
           JSON_TEXT=$(jq -r '.candidates[0].content.parts[0].text' .artifacts/ai.json)
 
+          echo "📋 Parsed JSON from Gemini:"
+          echo "$JSON_TEXT" | head -20
+
           # Extract fields and save to files to avoid shell argument limits
-          echo "$JSON_TEXT" | jq -r '.score' > .artifacts/jira-score.txt
-          echo "$JSON_TEXT" | jq -r '.verdict' > .artifacts/jira-verdict.txt
-          echo "$JSON_TEXT" | jq -r '.reasons | join("\n- ")' > .artifacts/jira-reasons.txt
-          echo "$JSON_TEXT" | jq -r '.fix_suggestions' > .artifacts/jira-fix.txt
-          echo "$JSON_TEXT" | jq -r '.fixed_summary' > .artifacts/jira-summary.txt
-          echo "$JSON_TEXT" | jq -r '.fixed_description' > .artifacts/jira-description.txt
+          echo "$JSON_TEXT" | jq -r '.score // 0' > .artifacts/jira-score.txt
+          echo "$JSON_TEXT" | jq -r '.verdict // "fail"' > .artifacts/jira-verdict.txt
+          echo "$JSON_TEXT" | jq -r '(.reasons // []) | join("\n- ")' > .artifacts/jira-reasons.txt
+          echo "$JSON_TEXT" | jq -r '.fix_suggestions // ""' > .artifacts/jira-fix.txt
+          echo "$JSON_TEXT" | jq -r '.fixed_summary // ""' > .artifacts/jira-summary.txt
+          echo "$JSON_TEXT" | jq -r '.fixed_description // ""' > .artifacts/jira-description.txt
 
           SCORE=$(cat .artifacts/jira-score.txt)
           VERDICT=$(cat .artifacts/jira-verdict.txt)
